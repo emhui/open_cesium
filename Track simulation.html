@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <!-- Use correct character set. -->
+    <meta charset="utf-8">
+    <!-- Tell IE to use the latest, best version. -->
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+    <!-- Make the app on mobile take up the full browser screen and disable user scaling. -->
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no">
+    <title>铁路模拟</title>
+    <!--     引入计算库 -->
+    <script src="./utils/utils.js"></script>
+    <!-- The Cesium library. -->
+    <script src="./node_modules/cesium/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.67/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <script src="./node_modules/echarts/dist/echarts.min.js"></script>
+    <!-- Style our app. -->
+    <link rel="stylesheet" href="index.css" media="screen">
+    <style>
+        .cesium-widget-credits,
+        .cesium-fullscreenButton {
+            display: none !important;
+        }
+
+        .tools {
+            position: absolute;
+            top: 10px;
+            left: 20px;
+            z-index: 100;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- A container for the Cesium Viewer to live in. -->
+    <div id="cesiumContainer" class="fullSize"></div>
+    <div id="loadingOverlay">
+        <h1>Loading...</h1>
+    </div>
+    <div id="toolbar">
+        <div id="interpolationMenu"></div>
+    </div>
+    </div>
+    <script>
+        var viewer = null
+        let default_token = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIxOTFkYWQwOS1lNTc2LTRiNWEtYWViYy1kMWRlYTMwMThmYmYiLCJpZCI6MTQyMTgsInNjb3BlcyI6WyJhc3IiLCJnYyJdLCJpYXQiOjE1NjUwNTg3Mjh9.-i_ptqSPUBS0xhew3bh5F66IdlYY1Kz_CZ5UkN1-0a0'
+
+        Cesium.Ion.defaultAccessToken = default_token
+
+        var viewer = new Cesium.Viewer('cesiumContainer', {
+            infoBox: false, //Disable InfoBox widget
+            selectionIndicator: false, //Disable selection indicator
+            shouldAnimate: true, // Enable animations
+            terrainProvider: Cesium.createWorldTerrain()
+        });
+
+        viewer.scene.globe.depthTestAgainstTerrain = false;
+        Cesium.Math.setRandomNumberSeed(3);
+        var start = Cesium.JulianDate.fromDate(new Date(2015, 2, 25, 8));
+        // 初始化时间设置
+        // 非常重要,影响了整个火车的整个生命周期
+        var stop = Cesium.JulianDate.addSeconds(start, 3800, new Cesium.JulianDate());
+
+        viewer.clock.startTime = start.clone();
+        viewer.clock.currentTime = start.clone();
+        viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP; //Loop at the end
+        viewer.clock.multiplier = 10;
+
+
+        // 模型Uri
+        let routerUrl = 'http://127.0.0.1:9090/gis/river/wander-3.kml'
+        let modelHeadaUrl = 'http://127.0.0.1:9090/gis/models/Railway/heada.glb'
+        let modelManUrl = 'http://127.0.0.1:9090/gis/models/CesiumMan/Cesium_Man.glb'
+        let modelMilkCarUrl = 'http://127.0.0.1:9090/gis/models/CesiumMilkTruck/CesiumMilkTruck.glb'
+        let modelBodyUrl = 'http://127.0.0.1:9090/gis/models/Railway/body.glb'
+        let modelBridgeUrl = 'http://127.0.0.1:9090/gis/models/Railway/bridge.glb'
+        let modelJiaZiUrl = 'http://127.0.0.1:9090/gis/models/Railway/jiazi.glb'
+        let modelRailwayUrl = 'http://127.0.0.1:9090/gis/models/Railway/railway.glb'
+        let redCarUrl = 'http://127.0.0.1:9090/gis/models/other/mazda_rx-7_fd/scene.gltf'
+
+
+        // 运动车厢的速度
+        let velocity = 30 // 速度,根据他来计算到达各个点的时间
+        // 当前目标点的位置
+        // var currentIndex = 1
+
+        // 每节车厢相对上一节车厢延时一定时间到达同一个位置
+        var delayTime = 13
+
+        // 存储所有运动中的实体对象
+        var dynamicEntities = []
+
+        // 运动模型数量
+        var dynamicNum = 5
+
+        // 每节铁轨的长度，用于计算两个点之前铺设多少节铁轨
+        var modelLength = 170
+
+        // 初始化dynamicEntitye
+        for (let i = 0; i < dynamicNum ; ++i) {
+            let obj = {
+                entity: null, // 实体对象
+                property: new Cesium.SampledPositionProperty(), // 动态位置属性
+                timeAndOrientationList: [],
+                startTime: 0,
+                endTime: 0
+            }
+            dynamicEntities.push(obj)
+        }
+
+        // 初始化路径 设置带时间的路径
+        viewer.dataSources.add(Cesium.KmlDataSource.load(routerUrl,
+            {
+                camera: viewer.scene.camera,
+                canvas: viewer.scene.canvas,
+                clampToGround: true
+            })
+        ).then(dataSource => {
+            var router = dataSource.entities.getById('0129AA13ED12D2857AD0');
+            viewer.flyTo(router)
+            var positions = router.polyline.positions._value
+            createDynamicPositions(positions) // 计算带时间的路径
+            createDynamicEntity() // 根据动态路径创建模型实体
+        })
+
+
+        function createDynamicPositions(positions) {
+            var length = positions.length
+            var totalTime = 0// 跑完全部路程的时间
+            positions.forEach((position, index, datas) => {
+                // 在每个路径转角处创建一个Point对象
+                CreatePoint(position, index)
+
+                // 计算到达下一个地点需要的时间
+                if (index + 1 < length) {
+                    // 设置铁轨模型
+                    repeateModel(datas[index + 1], datas[index])
+                    // 计算一个点到另一点需要到时间
+                    let time2Next = computeTime(datas[index], datas[index + 1])
+                    // 计算到两个点的方向
+                    let orientation = computeOrientation(datas[index], datas[index + 1])
+                    // 初始化每个实体的位置等属性
+                    dynamicEntities.forEach((dynamicEntity, i) => {
+                        // 每个运动模型相对延迟时间
+                        let time = totalTime + delayTime * i
+                        dynamicEntity.property.addSample(
+                            Cesium.JulianDate.addSeconds(start, time, new Cesium.JulianDate()),
+                            position
+                        )
+                        // 存储到到达目标位置的时间，方向，位置
+                        let obj = {
+                            time: totalTime, // 到达下一个点需要耗费的时间,它是一个数值，不是一个时间点
+                            position: position,
+                            orientation: orientation
+                        }
+
+                        // 计算开始时间
+                        if (index === 0) {
+                            dynamicEntity.startTime = Cesium.JulianDate.addSeconds(start, time, new Cesium.JulianDate())
+                        }
+
+                        // 计算最后一个时间
+                        if (index + 2 === length) {
+                            dynamicEntity.endTime = Cesium.JulianDate.addSeconds(start, time, new Cesium.JulianDate())
+                        }
+                        dynamicEntity.timeAndOrientationList.push(obj)
+                    })
+                    totalTime += time2Next
+                }
+            });
+        }
+
+        function CreatePoint(position, index) {
+            viewer.entities.add({
+                position: position,
+                label: {
+                    text: '地点' + index,
+                    font: '14pt monospace',
+                    style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                    outlineWidth: 2,
+                    verticalOrigin: Cesium.VerticalOrigin.TOP,
+                    pixelOffset: new Cesium.Cartesian2(0, 32)
+                },
+                point: {
+                    pixelSize: 5,
+                    color: Cesium.Color.YELLOW,
+                    outlineColor: Cesium.Color.WHITE,
+                    outlineWidth: 2
+                },
+            })
+        }
+
+        // var carEntity = null
+        
+        function createDynamicEntity() {
+            dynamicEntities.forEach((dynamicEntity, i) => {
+                // 将第一个运动模型设置为车头，其他的是车厢
+                let moedelUri = i === 0 ? modelHeadaUrl : modelBodyUrl
+                dynamicEntity.entity = viewer.entities.add({
+                    // 设置模型的运动时间，什么时候开始，什么时候结束
+                    availability: new Cesium.TimeIntervalCollection([new Cesium.TimeInterval({
+                        start: dynamicEntity.startTime,
+                        stop: dynamicEntity.endTime
+                    })]),
+                    position: dynamicEntity.property,
+                    // 方向正确的模型，可以直接使用这个，而不用自己手动计算方向
+                    // orientation: new Cesium.VelocityOrientationProperty(dynamicEntity.property),
+                    model: {
+                        uri: moedelUri,
+                        scale: 0.02
+                    },
+                    path: {
+                        resolution: 1,
+                        material: new Cesium.PolylineGlowMaterialProperty({
+                            glowPower: 0.1,
+                            color: Cesium.Color.YELLOW
+                        }),
+                        width: 10
+                    }
+                });
+            })
+        }
+
+        function changeOrientation(position, degree) {
+            var heading = Cesium.Math.toRadians(degree);
+            var pitch = Cesium.Math.toRadians(0.0);
+            var roll = Cesium.Math.toRadians(0.0);
+            var orientation = Cesium.Transforms.headingPitchRollQuaternion(position, new Cesium.HeadingPitchRoll(heading, pitch, roll));
+            return orientation
+        }
+
+/*         function changeOrientationByRadians(position, radians) {
+            var heading = radians;
+            var pitch = Cesium.Math.toRadians(0.0);
+            var roll = Cesium.Math.toRadians(0.0);
+            var orientation = Cesium.Transforms.headingPitchRollQuaternion(position, new Cesium.HeadingPitchRoll(heading, pitch, roll));
+            return orientation
+        } */
+
+
+        function repeateModel(posCart1, posCart2) {
+            // 需要摆放模型的数量
+            let modelNum = parseInt(computeDistance(posCart1, posCart2) / modelLength)
+            // 模型的方向
+            let heading = computeOrientation(posCart1, posCart2)
+            for (var i = 1; i < modelNum; ++i) {
+                var mid = new Cesium.Cartesian3()
+                Cesium.Cartesian3.add(
+                    Cesium.Cartesian3.multiplyByScalar(posCart1, i / modelNum, new Cesium.Cartesian3()),
+                    Cesium.Cartesian3.multiplyByScalar(posCart2, (modelNum - i) / modelNum,
+                        new Cesium.Cartesian3()),
+                    mid
+                )
+                viewer.entities.add({
+                    position: mid,
+                    model: {
+                        uri: modelRailwayUrl,
+                        scale: 0.025
+                    },
+                    orientation: changeOrientation(mid, heading)
+
+                })
+            }
+
+        }
+        // 计算两点的距离
+        function computeDistance(posCart1, posCart2) {
+            return Cesium.Cartesian3.distance(posCart1, posCart2)
+        }
+
+        // 计算两点之前需要的时间
+        function computeTime(posCart1, posCart2) {
+            let distance = computeDistance(posCart1, posCart2)
+            let time = distance / velocity
+            console.log(`time: ${time}\n distance: ${distance}`);
+
+            return time
+        }
+
+        function computeOrientation(posCart1, posCart2) {
+            let heading = bearing(
+                Cesium.Cartographic.fromCartesian(posCart1).latitude,
+                Cesium.Cartographic.fromCartesian(posCart1).longitude,
+                Cesium.Cartographic.fromCartesian(posCart2).latitude,
+                Cesium.Cartographic.fromCartesian(posCart2).longitude
+            )
+/*             let heading2 = computeAzimuth(
+                Cesium.Math.toRadians(
+
+            Cesium.Cartographic.fromCartesian(posCart1).longitude),
+                Cesium.Cartographic.fromCartesian(posCart1).latitude,
+                Cesium.Cartographic.fromCartesian(posCart2).longitude,
+                Cesium.Cartographic.fromCartesian(posCart2).latitude
+            )
+            console.log('第三个方法');
+            console.log(heading2);
+ */
+            return heading
+        }
+
+
+        // 计算两点之间的方向
+        function bearing(startLat, startLng, destLat, destLng) {
+            startLat = Cesium.Math.toRadians(startLat);
+            startLng = Cesium.Math.toRadians(startLng);
+            destLat = Cesium.Math.toRadians(destLat);
+            destLng = Cesium.Math.toRadians(destLng);
+
+            let y = Math.sin(destLng - startLng) * Math.cos(destLat);
+            let x = Math.cos(startLat) * Math.sin(destLat) - Math.sin(startLat) * Math.cos(destLat) * Math.cos(destLng - startLng);
+            let brng = Math.atan2(y, x);
+            let brngDgr = Cesium.Math.toDegrees(brng);
+            return (brngDgr + 360) % 360;
+        }
+
+        // 监听是否达到转角处
+        viewer.clock.onTick.addEventListener((clock) => {
+            dynamicEntities.forEach(dynamicEntity => {
+                // 这里每一个开始的时间差都不一样,所以需要设置一下开始时间
+                let timeOffset = Cesium.JulianDate.secondsDifference(clock.currentTime, dynamicEntity.startTime);
+                dynamicEntity.timeAndOrientationList.forEach((obj, index, array) => {
+                    if (timeOffset >= obj.time && timeOffset <= array[index + 1].time) {
+                        // 177在第一条铁轨是一个好的角度
+                        dynamicEntity.entity.orientation = changeOrientation(obj.position, obj.orientation + 180)
+                    }
+                })
+            })
+
+            /*             // This example uses time offsets from the start to identify which parts need loading.
+                        var timeOffset = Cesium.JulianDate.secondsDifference(clock.currentTime, clock.startTime);
+            
+                        // 方法一： 使用时间戳的方式进行转向
+                        timeAndOrientationList.forEach((obj, index, array) => {
+                            if (timeOffset >= obj.time && timeOffset <= array[index + 1].time) {
+                                carEntity.orientation = changeOrientation(obj.position, obj.orientation + 180)
+                            }
+                        }) */
+            // 方法二：使用判断当前位置的方法来进行转向
+            /*             if (carEntity && turningPoint) {
+                            var distance = computeDistance(turningPoint[currentIndex], carEntity.position.getValue(clock.currentTime));
+                            console.log(currentIndex, distance);
+            
+                            if (distance <= 10) {
+                                currentIndex++
+                                let obj = timeAndOrientationList[currentIndex - 1]
+                                carEntity.orientation = changeOrientation(obj.position, obj.orientation + 180)
+                            }
+                        } */
+        });
+
+        /*         viewer.extend(Cesium.viewerCesiumInspectorMixin); */
+    </script>
+
+</body>
+
+</html>
